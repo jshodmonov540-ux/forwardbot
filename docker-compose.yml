@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: forwardbot_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-forwardbot}
+      POSTGRES_USER: ${POSTGRES_USER:-botuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ChangeMeSecurePassword123!}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal_net
+    # E'tibor bering: ports bo'limi yo'q! Baza tashqariga (tashqi internetga) yopiq,
+    # faqat internal_net tarmog'idagi app uchun ochiq.
+    expose:
+      - "5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: forwardbot_redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal_net
+    expose:
+      - "6379"
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: forwardbot_app
+    restart: always
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD:-ChangeMeSecurePassword123!}@db:5432/${POSTGRES_DB:-forwardbot}
+      - REDIS_URL=redis://redis:6379/0
+    networks:
+      - internal_net
+      # Agar webhook ishlatilsa, kerakli tashqi portni ulash mumkin:
+      # - "8000:8000"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  internal_net:
+    driver: bridge
