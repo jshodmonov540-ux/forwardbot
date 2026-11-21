@@ -6,11 +6,53 @@ from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 from aiogram import Bot
 from aiogram.types import BufferedInputFile
+from aiogram.exceptions import TelegramRetryAfter
 
 from core.config import settings
 from core.logger import logger
 from db.base import async_session_factory
 from db import crud
+
+
+class FastMessageQueue:
+    """
+    Xabarlarni Telegram limitlariga tushmasdan (Flood control), 
+    tezkor (1-2 soniya ichida) va birorta ham xabar yo'qolmasligini kafolatlovchi asinxron navbat.
+    """
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def start(self):
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
+
+    async def put(self, send_fn, *args, **kwargs):
+        self.start()
+        await self.queue.put((send_fn, args, kwargs))
+
+    async def _worker_loop(self):
+        while True:
+            send_fn, args, kwargs = await self.queue.get()
+            try:
+                for attempt in range(3):
+                    try:
+                        await send_fn(*args, **kwargs)
+                        # Agar navbatda yana xabarlar bo'lsa, xavfsiz 0.3 soniya tanaffus
+                        if not self.queue.empty():
+                            await asyncio.sleep(0.3)
+                        break
+                    except TelegramRetryAfter as e:
+                        logger.warning(f"Telegram FloodWait cheklovi: {e.retry_after} soniya kutilmoqda...")
+                        await asyncio.sleep(e.retry_after + 0.5)
+                    except Exception as ex:
+                        logger.error(f"Kanalga yuborishda xatolik (urinish {attempt+1}/3): {ex}")
+                        if attempt < 2:
+                            await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"FastMessageQueue worker kutilmagan xatolik: {e}")
+            finally:
+                self.queue.task_done()
 
 
 class UserbotManager:
@@ -19,9 +61,11 @@ class UserbotManager:
         # 2FA kutayotgan vaqtinchalik clientlar: user_id -> client
         self.pending_logins: Dict[int, TelegramClient] = {}
         self.aiogram_bot: Optional[Bot] = None
+        self.fast_queue = FastMessageQueue()
 
     def set_bot(self, bot: Bot):
         self.aiogram_bot = bot
+        self.fast_queue.start()
 
     def get_api_credentials(self) -> tuple[int, str]:
         """API ID va API HASH ni olish"""
@@ -62,7 +106,7 @@ class UserbotManager:
             return False
 
     def _register_handlers(self, client: TelegramClient, user_id: int):
-        """Xabarlarni tinglash va forward qilish handlerini ulash"""
+        """Xabarlarni tinglash va navbat orqali xavfsiz/tezkor forward qilish"""
         @client.on(events.NewMessage(incoming=True))
         async def incoming_message_handler(event: events.NewMessage.Event):
             try:
@@ -87,87 +131,102 @@ class UserbotManager:
                     f"source={sender_chat_id} -> dest={dest_chat_id}"
                 )
 
-                # 1. Avval Userbot orqali kanalga forward qilishga urinib ko'ramiz
-                forwarded = False
+                # Yuboruvchi ismini aniqlash
                 try:
-                    dest_entity = await client.get_entity(dest_chat_id)
-                    await client.forward_messages(
-                        entity=dest_entity,
-                        messages=event.message,
-                    )
-                    logger.info(f"Userbot: Xabar muvaffaqiyatli forward qilindi: dest={dest_chat_id}")
-                    forwarded = True
-                except Exception as fwd_err:
-                    logger.warning(
-                        f"Userbot forward_messages qila olmadi ({fwd_err}). "
-                        f"Bot orqali to'g'ridan-to'g'ri kanalga yetkaziladi!"
-                    )
+                    sender = await event.get_sender()
+                except Exception:
+                    sender = None
 
-                # 2. Agar Userbot kanalni ko'ra olmasa, Bot (Aiogram) orqali kanalga tashlaymiz
-                if not forwarded:
-                    await self._send_via_bot(dest_chat_id, event)
+                sender_name = "Noma'lum"
+                if sender:
+                    if hasattr(sender, "title") and sender.title:
+                        sender_name = sender.title
+                    elif hasattr(sender, "first_name") and sender.first_name:
+                        sender_name = sender.first_name
+                        if getattr(sender, "last_name", None):
+                            sender_name += f" {sender.last_name}"
+                    elif hasattr(sender, "username") and sender.username:
+                        sender_name = f"@{sender.username}"
+
+                msg = event.message
+                text = msg.text or ""
+                header = f"<b>{sender_name}:</b>"
+                full_text = f"{header}\n{text}" if text else header
+
+                media_data = None
+                media_type = None
+                media_filename = None
+                is_voice = False
+                is_video = False
+
+                if msg.media:
+                    try:
+                        bio = io.BytesIO()
+                        await event.message.download_media(file=bio)
+                        bio.seek(0)
+                        media_data = bio.read()
+                        if isinstance(msg.media, MessageMediaPhoto):
+                            media_type = "photo"
+                        elif isinstance(msg.media, MessageMediaDocument):
+                            media_type = "document"
+                            media_filename = getattr(msg.file, "name", None) or "document"
+                            is_voice = bool(getattr(msg, "voice", False))
+                            is_video = bool(getattr(msg, "video", False))
+                    except Exception as med_err:
+                        logger.warning(f"Media yuklab olishda ogohlantirish: {med_err}")
+
+                # Xabarni navbatga uzatamiz (tezkor, birorta xabar yo'qolmasligi va flood bo'lmasligi uchun)
+                await self.fast_queue.put(
+                    self._send_payload_via_bot,
+                    dest_chat_id,
+                    full_text,
+                    media_data,
+                    media_type,
+                    media_filename,
+                    is_voice,
+                    is_video,
+                    sender_name,
+                )
 
             except Exception as e:
                 logger.error(f"Userbot xabarini yo'naltirishda kutilmagan xatolik: {e}")
 
-    async def _send_via_bot(self, dest_chat_id: int, event: events.NewMessage.Event) -> bool:
-        """Userbot o'rniga Bot orqali kanalga xabarni yetkazish (Yuboruvchi ismi bilan)"""
+    async def _send_payload_via_bot(
+        self,
+        dest_chat_id: int,
+        full_text: str,
+        media_data: Optional[bytes],
+        media_type: Optional[str],
+        media_filename: Optional[str],
+        is_voice: bool,
+        is_video: bool,
+        sender_name: str,
+    ) -> bool:
+        """Kanalga xabarni Bot orqali yetkazish (FloodWait va xatoliklarni qayta urinish bilan)"""
         if not self.aiogram_bot:
             logger.error("Aiogram bot sozlanmagan, kanalga yuborib bo'lmadi.")
             return False
 
-        # Yuboruvchi ismini aniqlash
-        try:
-            sender = await event.get_sender()
-        except Exception:
-            sender = None
-
-        sender_name = "Noma'lum"
-        if sender:
-            if hasattr(sender, "title") and sender.title:
-                sender_name = sender.title
-            elif hasattr(sender, "first_name") and sender.first_name:
-                sender_name = sender.first_name
-                if getattr(sender, "last_name", None):
-                    sender_name += f" {sender.last_name}"
-            elif hasattr(sender, "username") and sender.username:
-                sender_name = f"@{sender.username}"
-
-        msg = event.message
-        text = msg.text or ""
-        header = f"<b>{sender_name}:</b>"
-        full_text = f"{header}\n{text}" if text else header
-
-        try:
-            if msg.media:
-                bio = io.BytesIO()
-                await event.message.download_media(file=bio)
-                bio.seek(0)
-                data = bio.read()
-
-                if isinstance(msg.media, MessageMediaPhoto):
-                    input_file = BufferedInputFile(data, filename="photo.jpg")
-                    await self.aiogram_bot.send_photo(chat_id=dest_chat_id, photo=input_file, caption=full_text, parse_mode="HTML")
-                elif isinstance(msg.media, MessageMediaDocument):
-                    filename = getattr(msg.file, "name", None) or "document"
-                    input_file = BufferedInputFile(data, filename=filename)
-                    if getattr(msg, "voice", False):
-                        await self.aiogram_bot.send_voice(chat_id=dest_chat_id, voice=input_file, caption=full_text, parse_mode="HTML")
-                    elif getattr(msg, "video", False):
-                        await self.aiogram_bot.send_video(chat_id=dest_chat_id, video=input_file, caption=full_text, parse_mode="HTML")
-                    else:
-                        await self.aiogram_bot.send_document(chat_id=dest_chat_id, document=input_file, caption=full_text, parse_mode="HTML")
+        if media_data:
+            if media_type == "photo":
+                input_file = BufferedInputFile(media_data, filename="photo.jpg")
+                await self.aiogram_bot.send_photo(chat_id=dest_chat_id, photo=input_file, caption=full_text, parse_mode="HTML")
+            elif media_type == "document":
+                input_file = BufferedInputFile(media_data, filename=media_filename or "document")
+                if is_voice:
+                    await self.aiogram_bot.send_voice(chat_id=dest_chat_id, voice=input_file, caption=full_text, parse_mode="HTML")
+                elif is_video:
+                    await self.aiogram_bot.send_video(chat_id=dest_chat_id, video=input_file, caption=full_text, parse_mode="HTML")
                 else:
-                    input_file = BufferedInputFile(data, filename="file")
                     await self.aiogram_bot.send_document(chat_id=dest_chat_id, document=input_file, caption=full_text, parse_mode="HTML")
-            elif text:
-                await self.aiogram_bot.send_message(chat_id=dest_chat_id, text=full_text, parse_mode="HTML")
+            else:
+                input_file = BufferedInputFile(media_data, filename="file")
+                await self.aiogram_bot.send_document(chat_id=dest_chat_id, document=input_file, caption=full_text, parse_mode="HTML")
+        elif full_text:
+            await self.aiogram_bot.send_message(chat_id=dest_chat_id, text=full_text, parse_mode="HTML")
 
-            logger.info(f"Xabar Bot orqali muvaffaqiyatli kanalga yetkazildi ({sender_name}): dest={dest_chat_id}")
-            return True
-        except Exception as ex:
-            logger.error(f"Bot orqali kanalga yuborishda xatolik: {ex}")
-            return False
+        logger.info(f"Xabar Bot orqali muvaffaqiyatli kanalga yetkazildi ({sender_name}): dest={dest_chat_id}")
+        return True
 
     async def stop_userbot(self, user_id: int):
         """Userbotni to'xtatish"""
